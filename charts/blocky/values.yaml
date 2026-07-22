@@ -1,0 +1,167 @@
+# Default values for blocky.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -- Number of replicas for the deployment
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/0xerr0r/blocky
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag whose default is the chart appVersion
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full chart name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Specifies whether a service account should be created
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- The name of the service account to use. If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# -- Enable extra platform features
+openshift: false
+
+# -- Annotations for the blocky pod
+podAnnotations: {}
+# -- Labels for the blocky pod
+podLabels: {}
+
+# -- Pod security context settings
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context settings
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+# -- Persistence configuration for cache and logs directories
+persistence:
+  cache:
+    # -- Enable persistent volume claim for cache directory
+    enabled: false
+    # -- Access mode for cache PVC
+    accessMode: ReadWriteOnce
+    # -- Storage class for cache PVC
+    storageClass: ""
+    # -- Size of cache volume
+    size: 1Gi
+    # -- Use an existing PVC for cache
+    existingClaim: ""
+  logs:
+    # -- Enable persistent volume claim for query logs directory
+    enabled: false
+    # -- Access mode for query logs PVC
+    accessMode: ReadWriteOnce
+    # -- Storage class for query logs PVC
+    storageClass: ""
+    # -- Size of query logs volume
+    size: 5Gi
+    # -- Use an existing PVC for query logs
+    existingClaim: ""
+
+service:
+  # -- Kubernetes Service type
+  type: ClusterIP
+  # -- Port for DNS queries (UDP and TCP)
+  dnsPort: 5553
+  # -- Port for HTTP web server and Prometheus metrics
+  httpPort: 4000
+  # -- Service annotations
+  annotations: {}
+
+ingress:
+  # -- Enable ingress controller resource
+  enabled: false
+  # -- Ingress Class Name
+  className: ""
+  # -- Annotations for the ingress
+  annotations: {}
+  # -- Ingress host configurations
+  hosts:
+    - host: blocky.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  # -- Ingress TLS configuration
+  tls: []
+
+route:
+  # -- Enable Route resource
+  enabled: false
+  # -- Hostname for the Route
+  host: blocky.apps.example.com
+  # -- TLS configuration for Route
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+serviceMonitor:
+  # -- Enable Prometheus ServiceMonitor resource
+  enabled: false
+  # -- Prometheus scrape interval
+  interval: 30s
+  # -- Prometheus scrape timeout
+  scrapeTimeout: 10s
+
+# -- CPU/Memory resource requests and limits
+resources: {}
+
+# -- Liveness probe configuration
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+
+# -- Readiness probe configuration
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+
+# -- Node selector labels for pod assignment
+nodeSelector: {}
+
+# -- Node tolerations for pod assignment
+tolerations: []
+
+# -- Node affinity rules for pod assignment
+affinity: {}
+
+# -- Native Blocky configuration object (automatically converted to YAML and mounted to config.yml)
+config:
+  upstreams:
+    groups:
+      default:
+        - 1.1.1.1
+        - 1.0.0.1
+        - https://cloudflare-dns.com/dns-query
+  blocking:
+    denylists:
+      ads:
+        - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+    clientGroupsBlock:
+      default:
+        - ads
+  ports:
+    dns: 5553
+    http: 4000
+  prometheus:
+    enable: true
+    path: /metrics

@@ -17,3 +17,4 @@ coverage.html
 coverage.txt
 coverage/
 blocky
+!charts/blocky

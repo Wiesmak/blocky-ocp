@@ -1,0 +1,68 @@
+{{ template "chart.header" . }}
+{{ template "chart.deprecationWarning" . }}
+
+{{ template "chart.badgesSection" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.homepageLine" . }}
+
+## TL;DR
+
+```console
+helm install blocky ./charts/blocky
+```
+
+## Prerequisites
+
+* Kubernetes 1.19+
+
+{{ template "chart.requirementsSection" . }}
+
+## Installing the Chart
+
+To install the chart with the release name `blocky`:
+
+```console
+helm install blocky ./charts/blocky
+```
+
+## Uninstalling the Chart
+
+To uninstall/delete the `blocky` deployment:
+
+```console
+helm uninstall blocky
+```
+
+The command removes all the Kubernetes components associated with the chart and deletes the release.
+
+## Configuration
+
+Specify each parameter using the `--set key=value[,key=value]` argument to `helm install`. For example:
+
+```console
+helm install blocky \
+  --set replicaCount=2 \
+  ./charts/blocky
+```
+
+Alternatively, a YAML file that specifies the values for the parameters can be provided while installing the chart:
+
+```console
+helm install blocky -f values.yaml ./charts/blocky
+```
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.valuesSection" . }}
+
+## Changelog
+
+### 0.1.0
+
+* Initial release of the Blocky Helm chart.
+
+{{ template "helm-docs.versionFooter" . }}
