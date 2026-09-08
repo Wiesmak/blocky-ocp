@@ -94,21 +94,31 @@ func (r *ConditionalUpstreamResolver) Resolve(ctx context.Context, request *mode
 	resolved := false
 	if len(r.mapping) > 0 {
 		resolved, response, err = r.processRequest(ctx, request)
-		if err != nil {
-			return nil, err
-		}
 	}
 
+	// Revert the request before it leaves this resolver: the rewritten name is
+	// meant for the mapped upstream, not for the rest of the chain.
+	request.Req = original
+
+	// processRequest only reports `resolved` for a query it sent to a mapped
+	// upstream, so anything else continues down the chain under its original name.
 	if !resolved {
 		logger.WithField("next_resolver", Name(r.next)).Trace("go to next resolver")
-		response, err = r.next.Resolve(ctx, request)
-		if err != nil {
-			return nil, err
-		}
+
+		return r.next.Resolve(ctx, request)
 	}
 
-	// Revert the request
-	request.Req = original
+	// The mapped resolver failed or had nothing: ask the rest of the chain,
+	// using the original name (`fallbackUpstream`).
+	if shouldFallbackUpstream(&r.cfg.RewriterConfig, response, err) {
+		logger.WithField("next_resolver", Name(r.next)).Trace("fallback to next resolver")
+
+		return r.next.Resolve(ctx, request)
+	}
+
+	if err != nil {
+		return nil, err
+	}
 
 	// Revert rewrites in the response
 	if rewritten != nil && response != NoResponse && response != nil && response.Res != nil {

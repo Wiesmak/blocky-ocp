@@ -825,11 +825,17 @@ func (s *Server) resolve(ctx context.Context, request *model.Request) (response 
 
 	defer cancel()
 
-	// The resolver chain mutates request.Req in place and may add or enlarge an OPT record the
-	// client never sent (ECS, DNSSEC, the upstream EDNS0 buffer floor), so capture what the client
-	// itself asked for up front: the response is normalized against that, not the mutated request.
-	clientMaxResponseSize := getMaxResponseSize(request)
-	clientHadEdns0 := request.Req.IsEdns0() != nil
+	// The resolver chain mutates request.Req in place, so capture what the client itself asked for
+	// up front: the response is normalized against that, not the mutated request.
+	query := newClientQuery(request)
+
+	// Blocky doesn't implement DNS Cookies (RFC 7873), so a Server Cookie a client returns is one
+	// an upstream issued and blocky can neither validate nor reissue it. Forwarding it is worse
+	// than dropping it: it is likely to reach a different upstream than the one that issued it
+	// (`parallel_best` picks at random), which can't validate it either and may answer BADCOOKIE.
+	// The OPT record itself is kept, since it still carries the DO bit and the buffer size the
+	// client advertised.
+	util.RemoveEdns0OptionKeepRecord[*dns.EDNS0_COOKIE](request.Req)
 
 	switch {
 	case len(request.Req.Question) == 0:
@@ -854,34 +860,9 @@ func (s *Server) resolve(ctx context.Context, request *model.Request) (response 
 		}
 	}
 
-	response.Res.RecursionAvailable = request.Req.RecursionDesired
-
-	if !clientHadEdns0 {
-		// don't return an OPT record to a client that didn't use EDNS0 (RFC 6891 section 6.1.1)
-		util.RemoveEdns0Record(response.Res)
-	}
-
-	// truncate if necessary; Truncate also disables compression when the message already fits
-	// uncompressed and enables it when compression is needed to fit, so we let it decide rather
-	// than forcing Compress=true and paying a compression-map alloc + packing on every response.
-	response.Res.Truncate(clientMaxResponseSize)
+	query.normalizeResponse(response.Res)
 
 	return response, nil
-}
-
-// For TCP returns 64k
-// For UDP returns EDNS UDP size or if not present, 512
-func getMaxResponseSize(req *model.Request) int {
-	if req.Protocol == model.RequestProtocolTCP {
-		return dns.MaxMsgSize
-	}
-
-	edns := req.Req.IsEdns0()
-	if edns != nil && edns.UDPSize() > 0 {
-		return int(edns.UDPSize())
-	}
-
-	return dns.MinMsgSize
 }
 
 // OnHealthCheck Handler for docker health check. Just returns OK code without delegating to resolver chain
