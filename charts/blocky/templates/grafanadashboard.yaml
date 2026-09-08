@@ -1,0 +1,61 @@
+{{- if .Values.grafanaDashboard.basic.enabled }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: {{ include "blocky.fullname" . }}-basic
+  labels:
+    {{- include "blocky.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.grafanaDashboard.basic.grafanaCom }}
+  grafanaCom:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.basic.json }}
+  json: |-
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.basic.configMapRef }}
+  configMapRef:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  allowCrossNamespaceImport: {{ .Values.grafanaDashboard.basic.allowCrossNamespaceImport | default true }}
+  {{- with .Values.grafanaDashboard.basic.instanceSelector }}
+  instanceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+{{- if .Values.grafanaDashboard.logs.enabled }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: {{ include "blocky.fullname" . }}-logs
+  labels:
+    {{- include "blocky.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.grafanaDashboard.logs.grafanaCom }}
+  grafanaCom:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.logs.json }}
+  json: |-
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.logs.configMapRef }}
+  configMapRef:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  allowCrossNamespaceImport: {{ .Values.grafanaDashboard.logs.allowCrossNamespaceImport | default true }}
+  {{- with .Values.grafanaDashboard.logs.instanceSelector }}
+  instanceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.logs.folder }}
+  folder:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.grafanaDashboard.logs.datasources }}
+  datasources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
