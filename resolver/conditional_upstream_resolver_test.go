@@ -55,6 +55,12 @@ var _ = Describe("ConditionalUpstreamResolver", Label("conditionalResolver"), fu
 			return response
 		})
 
+		tldTestUpstream := NewMockUDPUpstreamServer().WithAnswerFn(func(request *dns.Msg) (response *dns.Msg) {
+			response, _ = util.NewMsgWithAnswer(request.Question[0].Name, 321, A, "10.10.10.10")
+
+			return response
+		})
+
 		refuseTestUpstream := NewMockUDPUpstreamServer().WithAnswerFn(func(request *dns.Msg) (response *dns.Msg) {
 			response = new(dns.Msg)
 			response.Rcode = dns.RcodeRefused
@@ -70,6 +76,7 @@ var _ = Describe("ConditionalUpstreamResolver", Label("conditionalResolver"), fu
 					"fritz.box":      {fbTestUpstream.Start()},
 					"other.box":      {otherTestUpstream.Start()},
 					"refused.domain": {refuseTestUpstream.Start()},
+					"xyz":            {tldTestUpstream.Start()},
 					".":              {dotTestUpstream.Start()},
 				},
 			},
@@ -163,6 +170,21 @@ var _ = Describe("ConditionalUpstreamResolver", Label("conditionalResolver"), fu
 				Expect(m.Calls).Should(BeEmpty())
 			})
 		})
+		When("Query is a subdomain of a TLD in mapping", func() {
+			It("Should resolve the IP via the TLD upstream", func() {
+				Expect(sut.Resolve(ctx, newRequest("foo.xyz.", A))).
+					Should(
+						SatisfyAll(
+							BeDNSRecord("foo.xyz.", A, "10.10.10.10"),
+							HaveTTL(BeNumerically("==", 321)),
+							HaveResponseType(ResponseTypeCONDITIONAL),
+							HaveReason("CONDITIONAL"),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+				// no call to next resolver
+				Expect(m.Calls).Should(BeEmpty())
+			})
+		})
 		When("Query is not fqdn and . condition is defined in mapping", func() {
 			It("Should resolve the IP of .", func() {
 				Expect(sut.Resolve(ctx, newRequest("test.", A))).
@@ -195,7 +217,7 @@ var _ = Describe("ConditionalUpstreamResolver", Label("conditionalResolver"), fu
 
 	When("upstream is invalid", func() {
 		It("succeeds with bootstrap resolver during construction", func() {
-			b := newTestBootstrap(ctx, &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeServerFailure}})
+			b := newTestBootstrap(ctx, &dns.Msg{Rcode: dns.RcodeServerFailure})
 
 			upstreamsCfg := defaultUpstreamsConfig
 			upstreamsCfg.Init.Strategy = config.InitStrategyFailOnError

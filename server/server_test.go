@@ -26,6 +26,8 @@ import (
 	"github.com/miekg/dns"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -432,6 +434,26 @@ var _ = Describe("Running DNS server", func() {
 					err = msg.Unpack(rawMsg)
 					Expect(err).Should(Succeed())
 
+					Expect(msg.Answer).Should(BeDNSRecord("www.example.com.", A, "123.124.122.122"))
+				})
+			})
+			When("DOH get request with a non-UTF-8 client ID in the URL is performed", func() {
+				It("should still get a valid response", func() {
+					resp, err := http.Get(queryURL + "/a%FFb?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB")
+					Expect(err).Should(Succeed())
+					DeferCleanup(resp.Body.Close)
+
+					Expect(resp).Should(HaveHTTPStatus(http.StatusOK))
+					Expect(resp).Should(HaveHTTPHeaderWithValue("Content-type", "application/dns-message"))
+
+					rawMsg, err := io.ReadAll(resp.Body)
+					Expect(err).Should(Succeed())
+
+					msg := new(dns.Msg)
+					err = msg.Unpack(rawMsg)
+					Expect(err).Should(Succeed())
+
+					Expect(msg.Rcode).Should(Equal(dns.RcodeSuccess))
 					Expect(msg.Answer).Should(BeDNSRecord("www.example.com.", A, "123.124.122.122"))
 				})
 			})
@@ -1114,6 +1136,32 @@ var _ = Describe("Running DNS server", func() {
 		})
 	})
 
+	Describe("newRequest", func() {
+		It("logs the request at trace level with what identifies it", func() {
+			logger, entries := test.NewNullLogger()
+			logger.SetLevel(logrus.TraceLevel)
+
+			ctx, _ = NewCtx(ctx, logrus.NewEntry(logger))
+
+			msg := util.NewMsgWithQuestion("example.com.", A)
+			msg.Id = 4711
+			clientIP := net.ParseIP("192.168.178.1")
+
+			_, _ = newRequest(ctx, clientIP, "client123", model.RequestProtocolUDP, msg)
+
+			Expect(entries.AllEntries()).Should(HaveLen(1))
+			Expect(entries.LastEntry().Message).Should(Equal("new incoming request"))
+			Expect(entries.LastEntry().Data).Should(SatisfyAll(
+				HaveKey("req_id"),
+				HaveKeyWithValue("question", util.QuestionToString(msg.Question)),
+				HaveKeyWithValue("client_ip", clientIP),
+				HaveKeyWithValue("client_request_id", msg.Id),
+				HaveKeyWithValue("client_id", "client123"),
+				HaveKeyWithValue("protocol", model.RequestProtocolUDP),
+			))
+		})
+	})
+
 	Describe("Query", func() {
 		It("should resolve a query", func() {
 			resp, err := sut.Query(ctx, "host.example.com", net.ParseIP("192.168.178.1"), "google.de.", dns.Type(dns.TypeA))
@@ -1559,9 +1607,6 @@ var _ = Describe("Running DNS server", func() {
 	})
 
 	Describe("response compression", func() {
-		// miekg's Truncate sets Compress=false when the message already fits uncompressed
-		// ("don't waste effort compressing this message"). resolve must honor that decision
-		// instead of clobbering it by forcing Compress=true on every response.
 		newServerWithResponse := func(res *dns.Msg) *Server {
 			m := resolver.NewMockChainedResolver(GinkgoT())
 			m.EXPECT().Resolve(mock.Anything, mock.Anything).RunAndReturn(
@@ -1580,7 +1625,8 @@ var _ = Describe("Running DNS server", func() {
 		}
 
 		When("the response fits the client buffer uncompressed", func() {
-			It("leaves compression disabled so Pack does not waste effort", func() {
+			// Some stub resolvers drop an answer whose owner name isn't a pointer (#2272).
+			It("still compresses it", func() {
 				res, err := util.NewMsgWithAnswer("example.com.", 123, A, "1.2.3.4")
 				Expect(err).Should(Succeed())
 
@@ -1591,7 +1637,12 @@ var _ = Describe("Running DNS server", func() {
 
 				resp, err := s.resolve(ctx, req)
 				Expect(err).Should(Succeed())
-				Expect(resp.Res.Compress).Should(BeFalse())
+
+				packed, err := resp.Res.Pack()
+				Expect(err).Should(Succeed())
+				// the answer's owner name, after the 12-byte header and the 17-byte question,
+				// points to the question's name at offset 12
+				Expect(packed[29:31]).Should(Equal([]byte{0xc0, 0x0c}))
 			})
 		})
 
@@ -1674,7 +1725,7 @@ var _ = Describe("Running DNS server", func() {
 			Expect(rr.Header().Get("Strict-Transport-Security")).Should(Equal("max-age=63072000"))
 			Expect(rr.Header().Get("X-Frame-Options")).Should(Equal("DENY"))
 			Expect(rr.Header().Get("X-Content-Type-Options")).Should(Equal("nosniff"))
-			Expect(rr.Header().Get("x-xss-protection")).Should(Equal("1; mode=block"))
+			Expect(rr.Header().Get("X-XSS-Protection")).Should(Equal("1; mode=block"))
 		})
 
 		It("should not set security headers for non-TLS requests", func() {
@@ -1865,3 +1916,36 @@ func writeKeyPem(tmpDir *TmpFolder) *TmpFile {
 		"EHK784GIxwVXKej/",
 		"-----END PRIVATE KEY-----")
 }
+
+type shutdownRecorder struct {
+	calls atomic.Int32
+}
+
+func (r *shutdownRecorder) Shutdown(context.Context) error {
+	r.calls.Add(1)
+
+	return nil
+}
+
+var _ = Describe("Stopping the server", func() {
+	It("finds the resolvers that hold work in the chain", func() {
+		Expect(sut.shutdowners).Should(ContainElement(BeAssignableToTypeOf(&resolver.QueryLoggingResolver{})))
+	})
+
+	It("shuts down the resolvers that hold work, once the DNS listeners have stopped", func(ctx context.Context) {
+		recorder := &shutdownRecorder{}
+		srv := &Server{shutdowners: []resolver.Shutdowner{recorder}}
+		srv.dnsServeWG.Add(1) // a listener that is still serving
+
+		stopped := make(chan error, 1)
+
+		go func() { stopped <- srv.Stop(ctx) }()
+
+		Consistently(recorder.calls.Load, "100ms").Should(BeZero())
+
+		srv.dnsServeWG.Done()
+
+		Eventually(stopped).Should(Receive(BeNil()))
+		Expect(recorder.calls.Load()).Should(BeNumerically("==", 1))
+	})
+})

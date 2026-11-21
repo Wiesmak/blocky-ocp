@@ -23,7 +23,7 @@ GO_BUILD_LD_FLAGS:=\
 GO_BUILD_OUTPUT:=$(BIN_OUT_DIR)/$(BINARY_NAME)$(BINARY_SUFFIX)
 
 # define version of golangci-lint here. If defined in tools.go, go mod perfoms automatically downgrade to older version which doesn't work with golang >=1.18
-GOLANG_LINT_VERSION=v2.12.2
+GOLANG_LINT_VERSION=v2.15.0
 
 GINKGO_PROCS?=
 
@@ -32,7 +32,7 @@ GINKGO_PROCS?=
 # -fuzz` only fuzzes one target in one package per invocation, so `make fuzz`
 # loops over every Fuzz* target in FUZZ_PKGS, time-boxing each at FUZZ_TIME.
 FUZZ_TIME?=30s
-FUZZ_PKGS?=./config ./util ./lists/parsers
+FUZZ_PKGS?=./config ./util ./lists/parsers ./cache/stringcache
 
 # Parallelism for e2e tests. e2e specs are dominated by container startup and
 # health-check waits rather than CPU, so oversubscribing beyond the core count
@@ -91,7 +91,7 @@ ifdef BIN_AUTOCAB
 endif
 
 test: check-go ## run tests
-	go tool ginkgo --label-filter="!e2e" --coverprofile=coverage.txt --covermode=atomic --cover -r ${GINKGO_PROCS}
+	go tool ginkgo --label-filter="!e2e" --coverprofile=coverage.txt --covermode=atomic --cover -r ${GINKGO_PROCS} --timeout 5m --flake-attempts=1
 	go tool cover -html coverage.txt -o coverage.html
 
 fuzz: check-go ## run each fuzz target for FUZZ_TIME (default 30s); e.g. make fuzz FUZZ_TIME=2m

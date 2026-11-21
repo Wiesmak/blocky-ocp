@@ -41,6 +41,13 @@ var _ = Describe("CustomDNSResolver", func() {
 
 		zoneHdr := dns.RR_Header{Ttl: zoneTTL}
 
+		newRR := func(s string) dns.RR {
+			rr, err := dns.NewRR(s)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			return rr
+		}
+
 		cfg = config.CustomDNS{
 			Mapping: config.CustomDNSMapping{
 				"custom.domain": {&dns.A{A: net.ParseIP("192.168.143.123")}},
@@ -61,6 +68,34 @@ var _ = Describe("CustomDNSResolver", func() {
 					"srv.":             {&dns.SRV{Priority: 0, Weight: 5, Port: 12345, Target: "service", Hdr: zoneHdr}},
 					"txt.":             {&dns.TXT{Txt: []string{"space", "separated", "value"}, Hdr: zoneHdr}},
 					"mx.domain.":       {&dns.MX{Mx: "mx.domain", Hdr: zoneHdr}},
+					// A name that carries a supported record next to a type custom DNS
+					// cannot answer from.
+					"unsupported.mixed.": {
+						newRR("unsupported.mixed. 3600 IN A 5.6.7.8"),
+						newRR(`unsupported.mixed. 3600 IN CAA 0 issue "ca.example.net"`),
+					},
+					// HTTPS and SVCB records (RFC 9460) next to the address records of a name
+					"https.zone.": {
+						newRR("https.zone. 3600 IN A 192.168.1.10"),
+						newRR(`https.zone. 1800 IN HTTPS 1 . alpn="h3,h2" ipv4hint=192.168.1.10`),
+						newRR(`https.zone. 1800 IN HTTPS 2 alt.https.zone. alpn="h2" port=8443`),
+					},
+					"alias.zone.": {
+						newRR("alias.zone. 3600 IN HTTPS 0 pool.svc.example."),
+					},
+					"_dns.resolver.zone.": {
+						newRR(`_dns.resolver.zone. 3600 IN SVCB 1 dns.resolver.zone. alpn="dot" port=853`),
+					},
+					// A regular zone apex, which normally carries SOA and NS records.
+					"apex.zone.": {
+						newRR("apex.zone. 3600 IN SOA ns1.apex.zone. hostmaster.apex.zone. 1 7200 3600 1209600 3600"),
+						newRR("apex.zone. 3600 IN NS ns1.apex.zone."),
+						newRR("apex.zone. 3600 IN A 9.9.9.9"),
+					},
+					"ns.zone.": {
+						newRR("ns.zone. 3600 IN NS ns1.ns.zone."),
+						newRR("ns.zone. 3600 IN A 10.0.0.1"),
+					},
 				},
 			},
 			CustomTTL:           config.Duration(time.Duration(TTL) * time.Second),
@@ -101,6 +136,17 @@ var _ = Describe("CustomDNSResolver", func() {
 
 				Expect(err).Should(HaveOccurred())
 				Expect(err.Error()).Should(ContainSubstring("context canceled"))
+			})
+		})
+		When("No records are configured", func() {
+			BeforeEach(func() {
+				cfg = config.CustomDNS{}
+			})
+
+			It("should delegate to the next resolver", func() {
+				Expect(sut.Resolve(ctx, newRequest("custom.domain.", A))).ShouldNot(BeNil())
+
+				m.AssertCalled(GinkgoT(), "Resolve", mock.Anything)
 			})
 		})
 		When("Creating the IP response returns an error ", func() {
@@ -435,13 +481,161 @@ var _ = Describe("CustomDNSResolver", func() {
 						))
 			})
 		})
-		When("An unsupported DNS query type is queried from the resolver but found in the config mapping ", func() {
-			It("an error should be returned", func() {
-				By("MX query", func() {
-					_, err := sut.Resolve(ctx, newRequest("mx.domain", MX))
-					Expect(err).Should(HaveOccurred())
-					Expect(err.Error()).Should(ContainSubstring("unsupported customDNS RR type *dns.MX"))
+		When("HTTPS or SVCB records are defined in the zone", func() {
+			It("returns the HTTPS records with their SvcParams and zone TTL", func() {
+				resp, err := sut.Resolve(ctx, newRequest("https.zone.", HTTPS))
+				Expect(err).Should(Succeed())
+				Expect(resp).Should(
+					SatisfyAll(
+						WithTransform(ToAnswer, SatisfyAll(
+							HaveLen(2),
+							ContainElements(
+								BeDNSRecord("https.zone.", HTTPS, `1 . alpn="h3,h2" ipv4hint="192.168.1.10"`),
+								BeDNSRecord("https.zone.", HTTPS, `2 alt.https.zone. alpn="h2" port="8443"`)),
+						)),
+						HaveTTL(BeNumerically("==", 1800)),
+						HaveResponseType(ResponseTypeCUSTOMDNS),
+						HaveReason("CUSTOM DNS"),
+						HaveReturnCode(dns.RcodeSuccess),
+					))
+
+				// will not delegate to next resolver
+				m.AssertNotCalled(GinkgoT(), "Resolve", mock.Anything)
+			})
+			It("returns an AliasMode HTTPS record", func() {
+				Expect(sut.Resolve(ctx, newRequest("alias.zone.", HTTPS))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, SatisfyAll(
+								HaveLen(1),
+								ContainElements(BeDNSRecord("alias.zone.", HTTPS, "0 pool.svc.example.")),
+							)),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("returns SVCB records for an SVCB query", func() {
+				Expect(sut.Resolve(ctx, newRequest("_dns.resolver.zone.", SVCB))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, SatisfyAll(
+								HaveLen(1),
+								ContainElements(
+									BeDNSRecord("_dns.resolver.zone.", SVCB, `1 dns.resolver.zone. alpn="dot" port="853"`)),
+							)),
+							HaveResponseType(ResponseTypeCUSTOMDNS),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("does not answer an HTTPS query with an SVCB record, or the other way round", func() {
+				By("HTTPS query for a name with SVCB records", func() {
+					Expect(sut.Resolve(ctx, newRequest("_dns.resolver.zone.", HTTPS))).
+						Should(
+							SatisfyAll(
+								WithTransform(ToAnswer, BeEmpty()),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
 				})
+
+				By("SVCB query for a name with HTTPS records", func() {
+					Expect(sut.Resolve(ctx, newRequest("https.zone.", SVCB))).
+						Should(
+							SatisfyAll(
+								WithTransform(ToAnswer, BeEmpty()),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+				})
+			})
+			It("keeps answering the address records of the same name", func() {
+				Expect(sut.Resolve(ctx, newRequest("https.zone.", A))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, SatisfyAll(
+								HaveLen(1),
+								ContainElements(BeDNSRecord("https.zone.", A, "192.168.1.10")),
+							)),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("answers a subdomain under the queried name without sharing the zone record", func() {
+				subdomain, err := sut.Resolve(ctx, newRequest("www.https.zone.", HTTPS))
+				Expect(err).Should(Succeed())
+
+				apex, err := sut.Resolve(ctx, newRequest("https.zone.", HTTPS))
+				Expect(err).Should(Succeed())
+
+				// each response gets its own records: answering the second query must not
+				// rename the records of the first one
+				Expect(subdomain).Should(
+					WithTransform(ToAnswer, SatisfyAll(
+						HaveLen(2),
+						ContainElements(
+							BeDNSRecord("www.https.zone.", HTTPS, `1 . alpn="h3,h2" ipv4hint="192.168.1.10"`),
+							BeDNSRecord("www.https.zone.", HTTPS, `2 alt.https.zone. alpn="h2" port="8443"`)),
+					)))
+				Expect(apex).Should(
+					WithTransform(ToAnswer, SatisfyAll(
+						HaveLen(2),
+						HaveEach(WithTransform(func(rr dns.RR) string { return rr.Header().Name }, Equal("https.zone."))),
+					)))
+			})
+		})
+		When("An unsupported DNS record type is defined in the config", func() {
+			It("returns NODATA for a query of that type", func() {
+				By("MX query", func() {
+					Expect(sut.Resolve(ctx, newRequest("mx.domain", MX))).
+						Should(
+							SatisfyAll(
+								WithTransform(ToAnswer, BeEmpty()),
+								HaveResponseType(ResponseTypeCUSTOMDNS),
+								HaveReturnCode(dns.RcodeSuccess),
+							))
+				})
+			})
+		})
+		When("A zone entry has a record type custom DNS cannot answer from", func() {
+			It("answers the query type that is defined for the name", func() {
+				Expect(sut.Resolve(ctx, newRequest("unsupported.mixed.", A))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, SatisfyAll(
+								HaveLen(1),
+								ContainElements(BeDNSRecord("unsupported.mixed.", A, "5.6.7.8")),
+							)),
+							HaveResponseType(ResponseTypeCUSTOMDNS),
+							HaveReason("CUSTOM DNS"),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("answers the zone apex although the zone carries SOA and NS records", func() {
+				Expect(sut.Resolve(ctx, newRequest("apex.zone.", A))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, SatisfyAll(
+								HaveLen(1),
+								ContainElements(BeDNSRecord("apex.zone.", A, "9.9.9.9")),
+							)),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("returns NODATA for an unmapped query type instead of an error", func() {
+				Expect(sut.Resolve(ctx, newRequest("ns.zone.", TXT))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, BeEmpty()),
+							HaveResponseType(ResponseTypeCUSTOMDNS),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
+			})
+			It("returns NODATA when that unsupported type itself is requested", func() {
+				Expect(sut.Resolve(ctx, newRequest("unsupported.mixed.", dns.Type(dns.TypeCAA)))).
+					Should(
+						SatisfyAll(
+							WithTransform(ToAnswer, BeEmpty()),
+							HaveResponseType(ResponseTypeCUSTOMDNS),
+							HaveReturnCode(dns.RcodeSuccess),
+						))
 			})
 		})
 		When("Reverse DNS request is received", func() {

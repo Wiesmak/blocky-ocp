@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -282,6 +284,8 @@ type Config struct {
 	QueryLog QueryLog `yaml:"queryLog"`
 	// Prometheus metrics configuration.
 	Prometheus Metrics `yaml:"prometheus"`
+	// Go profiler (pprof) endpoints served under /debug.
+	Pprof Pprof `yaml:"pprof"`
 	// In-memory statistics subsystem (24h window), served at /api/stats.
 	Statistics Statistics `yaml:"statistics"`
 	// Redis configuration for cache and state synchronization between instances.
@@ -432,25 +436,33 @@ func (c *Ports) proxyProtocolListenConfig(listener ProxyProtocolType) (ListenCon
 	}
 }
 
-// privilegedPortCeiling is the first non-privileged TCP/UDP port. Ports below
+// PrivilegedPortCeiling is the first non-privileged TCP/UDP port. Ports below
 // it require CAP_NET_BIND_SERVICE (or root) to bind on Linux.
-const privilegedPortCeiling = 1024
+const PrivilegedPortCeiling = 1024
 
 // PrivilegedPorts returns the configured listen addresses across DNS, HTTP,
-// HTTPS and TLS whose port is below privilegedPortCeiling.
+// HTTPS and TLS whose port is below PrivilegedPortCeiling.
 func (p *Ports) PrivilegedPorts() []string {
-	var privileged []string
+	return p.PortsBelow(PrivilegedPortCeiling)
+}
+
+// PortsBelow returns the configured listen addresses across DNS, HTTP, HTTPS
+// and TLS whose port is below limit. Linux lets the first unprivileged port be
+// moved with the net.ipv4.ip_unprivileged_port_start sysctl, so callers that
+// know its value can pass it here instead of using PrivilegedPorts.
+func (p *Ports) PortsBelow(limit uint16) []string {
+	var below []string
 
 	for _, lc := range []ListenConfig{p.DNS, p.HTTP, p.HTTPS, p.TLS} {
 		for _, addr := range lc {
 			// Port 0 (OS-assigned ephemeral port) is never privileged.
-			if port, ok := extractPort(addr); ok && port > 0 && port < privilegedPortCeiling {
-				privileged = append(privileged, addr)
+			if port, ok := extractPort(addr); ok && port > 0 && port < limit {
+				below = append(below, addr)
 			}
 		}
 	}
 
-	return privileged
+	return below
 }
 
 // extractPort returns the port number of a listen address. It accepts every
@@ -667,6 +679,31 @@ func LoadConfig(path string, mandatory bool) (rCfg *Config, rerr error) {
 	return loadConfig(logger, path, mandatory)
 }
 
+// LoadConfigWithLogger is LoadConfig logging what it finds in the config to logger
+func LoadConfigWithLogger(logger *logrus.Entry, path string, mandatory bool) (*Config, error) {
+	return loadConfig(logger, path, mandatory)
+}
+
+// loading is the logger of the config load in progress, for the checks that run while
+// yaml decodes a value and so can't be handed one
+//
+//nolint:gochecknoglobals
+var loading atomic.Pointer[logrus.Entry]
+
+// loadMu serializes loads, so loading belongs to one load at a time
+//
+//nolint:gochecknoglobals
+var loadMu sync.Mutex
+
+// loadLogger returns the logger of the config load in progress, or the global logger
+func loadLogger() *logrus.Entry {
+	if logger := loading.Load(); logger != nil {
+		return logger
+	}
+
+	return logrus.NewEntry(log.Log())
+}
+
 func loadConfig(logger *logrus.Entry, path string, mandatory bool) (rCfg *Config, rerr error) {
 	cfg, err := WithDefaults[Config]()
 	if err != nil {
@@ -678,6 +715,12 @@ func loadConfig(logger *logrus.Entry, path string, mandatory bool) (rCfg *Config
 			util.LogPrivacy.Store(rCfg.Log.Privacy)
 		}
 	}()
+
+	loadMu.Lock()
+	defer loadMu.Unlock()
+
+	loading.Store(logger)
+	defer loading.Store(nil)
 
 	fs, err := os.Stat(path)
 	if err != nil {
@@ -702,8 +745,12 @@ func loadConfig(logger *logrus.Entry, path string, mandatory bool) (rCfg *Config
 		return nil, fmt.Errorf("failed to unmarshal config from %s: %w", prettyPath, err)
 	}
 
+	if err := cfg.validate(logger); err != nil {
+		return nil, err
+	}
+
 	if err := cfg.Ports.validate(); err != nil {
-		logger.Fatal(err)
+		return nil, err
 	}
 
 	// Normalize rewrite keys to lowercase after unmarshaling
@@ -859,8 +906,6 @@ func unmarshalConfig(logger *logrus.Entry, data []byte, cfg *Config, sources []c
 		logger.Error("configuration uses deprecated options, see warning logs for details")
 	}
 
-	cfg.validate(logger)
-
 	return nil
 }
 
@@ -961,7 +1006,7 @@ func (cfg *Config) migrate(logger *logrus.Entry) bool {
 	return usesDepredOpts
 }
 
-func (cfg *Config) validate(logger *logrus.Entry) {
+func (cfg *Config) validate(logger *logrus.Entry) error {
 	cfg.MinTLSServeVer.validate(logger)
 	cfg.Upstreams.validate(logger)
 
@@ -972,16 +1017,14 @@ func (cfg *Config) validate(logger *logrus.Entry) {
 
 	// DNS64 validation
 	if err := cfg.DNS64.validate(logger, &cfg.Filtering, &cfg.Caching); err != nil {
-		logger.Fatal(err)
+		return err
 	}
 
 	if err := cfg.RateLimit.validate(); err != nil {
-		logger.Fatal(err)
+		return err
 	}
 
-	if err := cfg.RebindingProtection.validate(); err != nil {
-		logger.Fatal(err)
-	}
+	return cfg.RebindingProtection.validate()
 }
 
 // ConvertPort converts string representation into a valid port (0 - 65535)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,38 +27,41 @@ var (
 
 	// raiseNetBindService is a seam so tests can stub the capability raise.
 	raiseNetBindService = util.RaiseNetBindService
+
+	// unprivilegedPortStartFile is a seam so tests can point at a fake sysctl.
+	unprivilegedPortStartFile = "/proc/sys/net/ipv4/ip_unprivileged_port_start"
 )
 
 const shutdownTimeout = 10 * time.Second
 
 func newServeCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:               "serve",
-		Args:              cobra.NoArgs,
-		Short:             "start blocky DNS server (default command)",
-		RunE:              startServer,
-		PersistentPreRunE: initConfigPreRun,
-		SilenceUsage:      true,
+		Use:          "serve",
+		Args:         cobra.NoArgs,
+		Short:        "start blocky DNS server (default command)",
+		RunE:         startServer,
+		SilenceUsage: true,
 	}
 }
 
 // privilegedPortCapHint describes how to satisfy the CAP_NET_BIND_SERVICE
-// requirement for binding ports below 1024.
-const privilegedPortCapHint = "grant CAP_NET_BIND_SERVICE (Kubernetes " +
-	"securityContext capabilities.add, or docker run --cap-add NET_BIND_SERVICE) " +
-	"or use a port >= 1024"
+// requirement. start is the first port that doesn't need it.
+func privilegedPortCapHint(start uint16) string {
+	return fmt.Sprintf("grant CAP_NET_BIND_SERVICE (Kubernetes securityContext "+
+		"capabilities.add, or docker run --cap-add NET_BIND_SERVICE) or use a port >= %d", start)
+}
 
 // warnMissingPrivilegedPortCapability raises CAP_NET_BIND_SERVICE if it is
-// available, and warns when a privileged port (< 1024) is configured but the
-// capability could not be obtained. It never fails: any real bind error
-// surfaces later from server.NewServer.
+// available, and warns when a privileged port (see privilegedPorts) is
+// configured but the capability could not be obtained. It never fails: any
+// real bind error surfaces later from server.NewServer.
 func warnMissingPrivilegedPortCapability(ports config.Ports) {
 	effective, err := raiseNetBindService()
 	if err != nil {
-		if privileged := ports.PrivilegedPorts(); len(privileged) > 0 {
+		if privileged, start := privilegedPorts(ports); len(privileged) > 0 {
 			log.Log().Warnf("could not adjust process capabilities (%v); binding "+
 				"privileged port(s) %s may fail — %s",
-				err, strings.Join(privileged, ", "), privilegedPortCapHint)
+				err, strings.Join(privileged, ", "), privilegedPortCapHint(start))
 
 			return
 		}
@@ -71,21 +75,56 @@ func warnMissingPrivilegedPortCapability(ports config.Ports) {
 		return
 	}
 
-	if privileged := ports.PrivilegedPorts(); len(privileged) > 0 {
+	if privileged, start := privilegedPorts(ports); len(privileged) > 0 {
 		log.Log().Warnf("configured to listen on privileged port(s) %s without "+
-			"CAP_NET_BIND_SERVICE; %s", strings.Join(privileged, ", "), privilegedPortCapHint)
+			"CAP_NET_BIND_SERVICE; %s", strings.Join(privileged, ", "), privilegedPortCapHint(start))
 	}
 }
 
-func startServer(_ *cobra.Command, _ []string) error {
-	printBanner()
+// privilegedPorts returns the configured ports that need CAP_NET_BIND_SERVICE,
+// and the first port that doesn't.
+func privilegedPorts(ports config.Ports) ([]string, uint16) {
+	start := unprivilegedPortStart()
 
-	cfg, err := config.LoadConfig(configPath, isConfigMandatory)
+	return ports.PortsBelow(start), start
+}
+
+// unprivilegedPortStart returns net.ipv4.ip_unprivileged_port_start, the first
+// port that can be bound without CAP_NET_BIND_SERVICE. Docker sets it to 0 in
+// a container's network namespace. When it can't be read (not Linux, or no
+// /proc), it falls back to config.PrivilegedPortCeiling.
+func unprivilegedPortStart() uint16 {
+	b, err := os.ReadFile(unprivilegedPortStartFile)
 	if err != nil {
-		return fmt.Errorf("unable to load configuration: %w", err)
+		return config.PrivilegedPortCeiling
 	}
 
-	log.Configure(&cfg.Log)
+	start, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 16)
+	if err != nil {
+		return config.PrivilegedPortCeiling
+	}
+
+	return uint16(start)
+}
+
+// loadServerConfig loads the config, sets up logging from it and logs the banner
+func loadServerConfig() (*config.Config, error) {
+	cfg, err := loadConfig(isConfigMandatory, func(cfg *config.Config) {
+		log.Configure(&cfg.Log)
+		printBanner()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to load configuration: %w", err)
+	}
+
+	return cfg, nil
+}
+
+func startServer(_ *cobra.Command, _ []string) error {
+	cfg, err := loadServerConfig()
+	if err != nil {
+		return err
+	}
 
 	warnMissingPrivilegedPortCapability(cfg.Ports)
 

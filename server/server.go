@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xERR0R/blocky/cache"
@@ -23,9 +26,9 @@ import (
 	"github.com/0xERR0R/blocky/server/freebind"
 
 	"github.com/0xERR0R/blocky/util"
-	goredis "github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-multierror"
+	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/miekg/dns"
@@ -54,6 +57,23 @@ type Server struct {
 	http3Server      *http3Server     // nil when disabled
 	http3PacketConns []net.PacketConn // one per address in ports.https
 	closers          []io.Closer
+	redisCancel      context.CancelFunc
+
+	// shutdowners are the resolvers holding work in memory, like the query log;
+	// Stop lets them finish it once the DNS listeners have stopped.
+	shutdowners []resolver.Shutdowner
+
+	// dnsStartCancels holds the cancel funcs of every DNS startup context
+	// created by Start; Stop cancels all of them to abort bind retries and
+	// stop the serve loops. A slice (rather than a single func) is kept so a
+	// second Start does not orphan the first one's context.
+	dnsStartCancels []context.CancelFunc
+	dnsCancelMu     sync.Mutex     // guards dnsStartCancels
+	dnsServeWG      sync.WaitGroup // tracks the DNS serve goroutines started in Start
+
+	// The DNS startup state above is populated by Start and read by Stop, so
+	// Start must be called (and return) before Stop; the two are not concurrent.
+	stopped atomic.Bool // guards against a double Stop
 }
 
 func logger() *logrus.Entry {
@@ -146,21 +166,40 @@ func NewServer(ctx context.Context, cfg *config.Config) (server *Server, err err
 		return nil, fmt.Errorf("failed to create bootstrap resolver: %w", err)
 	}
 
-	var redisConn *goredis.Client
-	if cfg.Redis.IsEnabled() {
-		redisConn, err = redis.New(ctx, &cfg.Redis)
-		if err != nil {
-			if cfg.Redis.Required {
-				return nil, fmt.Errorf("failed to create required Redis client: %w", err)
-			}
+	var (
+		redisConn      *goredis.Client
+		redisConnected bool
+		redisCancel    context.CancelFunc
+		redisClosers   []io.Closer
+	)
 
-			logger().WithError(err).Warn("Redis is enabled but optional and could not be initialized, continuing without Redis")
+	redisCtx := ctx
+	if cfg.Redis.IsEnabled() {
+		redisCtx, redisCancel = context.WithCancel(ctx)
+		defer func() {
+			if err != nil {
+				redisCancel()
+				closeAll(redisClosers)
+			}
+		}()
+
+		redisConn, redisConnected, err = createRedisClient(redisCtx, &cfg.Redis)
+		if err != nil {
+			return nil, err
 		}
+
+		redisClosers = append(redisClosers, redisConn)
 	}
 
-	redisResult, err := createRedisCacheDecorator(ctx, redisConn, cfg.Redis.Required)
+	addRedisCloser := func(c io.Closer) { redisClosers = append([]io.Closer{c}, redisClosers...) }
+
+	redisResult, err := createRedisCacheDecorator(redisCtx, redisConn, cfg.Redis.Required, redisConnected, addRedisCloser)
 	if err != nil {
 		return nil, err
+	}
+
+	if redisResult.bridge != nil {
+		addRedisCloser(redisResult.bridge)
 	}
 
 	queryResolver, queryError := createQueryResolver(ctx, cfg, bootstrap, redisResult.decorator)
@@ -168,20 +207,23 @@ func NewServer(ctx context.Context, cfg *config.Config) (server *Server, err err
 		return nil, queryError
 	}
 
+	var shutdowners []resolver.Shutdowner
+
+	resolver.ForEach(queryResolver, func(res resolver.Resolver) {
+		if sd, ok := res.(resolver.Shutdowner); ok {
+			shutdowners = append(shutdowners, sd)
+		}
+	})
+
 	server = &Server{
 		dnsServers:       dnsServers,
 		queryResolver:    queryResolver,
 		cfg:              cfg,
 		servers:          make(map[net.Listener]*httpServer),
 		http3PacketConns: http3PacketConns,
-	}
-
-	if redisResult.bridge != nil {
-		server.closers = append(server.closers, redisResult.bridge)
-	}
-
-	if redisConn != nil {
-		server.closers = append(server.closers, redisConn)
+		redisCancel:      redisCancel,
+		closers:          redisClosers,
+		shutdowners:      shutdowners,
 	}
 
 	server.printConfiguration()
@@ -316,10 +358,9 @@ func newTCPListeners(
 	ctx context.Context, proto string, addresses config.ListenConfig, proxyProtocol bool,
 ) ([]net.Listener, error) {
 	listeners := make([]net.Listener, 0, len(addresses))
-	lc := &net.ListenConfig{}
 
 	for _, address := range addresses {
-		listener, err := lc.Listen(ctx, networkTCP, address)
+		listener, err := listenTCPRetry(ctx, address)
 		if err != nil {
 			return nil, fmt.Errorf("start %s listener on %s failed: %w", proto, address, err)
 		}
@@ -380,6 +421,7 @@ func createDNSServer(ctx context.Context, network, address string, tlsCfg *tls.C
 
 	if network == networkUDP {
 		srv.UDPSize = maxUDPBufferSize
+		srv.MsgAcceptFunc = acceptUDPQuery
 	}
 
 	if tlsCfg != nil {
@@ -441,6 +483,28 @@ func attachListener(ctx context.Context, srv *dns.Server, network, address strin
 	return nil
 }
 
+// queryStackSize is the call frame the goroutine of a UDP query makes room for, see
+// util.GrowStack. The runtime doubles the 2 KiB stack the goroutine starts with until
+// the frame fits, which gives it 16 KiB: enough to answer a query without growing the
+// stack again.
+const queryStackSize = 8 << 10
+
+// acceptUDPQuery is the first code that runs on the goroutine of a UDP query, before the
+// query is unpacked.
+//
+// Each UDP query gets a new goroutine. Without growing its stack here, the runtime
+// doubles it up to three times per query: to unpack the query, inside the resolver
+// chain, and when the query is sent to an upstream. The goroutine of a packet the
+// server ignores or rejects keeps its stack.
+func acceptUDPQuery(dh dns.Header) dns.MsgAcceptAction {
+	action := dns.DefaultMsgAcceptFunc(dh)
+	if action == dns.MsgAccept {
+		util.GrowStack[[queryStackSize]byte]()
+	}
+
+	return action
+}
+
 func createTLSServer(ctx context.Context, address string, tlsCfg *tls.Config, opts listenerOptions,
 ) (*dns.Server, error) {
 	return createDNSServer(ctx, networkTCPTLS, address, tlsCfg, opts)
@@ -454,19 +518,41 @@ func createUDPServer(ctx context.Context, address string, opts listenerOptions) 
 	return createDNSServer(ctx, networkUDP, address, nil, opts)
 }
 
+// createRedisClient keeps an optional client whose startup Ping failed so it can reconnect.
+func createRedisClient(ctx context.Context, cfg *config.Redis) (client *goredis.Client, connected bool, err error) {
+	client, err = redis.New(ctx, cfg)
+	if err == nil {
+		return client, true, nil
+	}
+
+	if cfg.Required {
+		if client != nil {
+			_ = client.Close()
+		}
+
+		return nil, false, fmt.Errorf("failed to create required Redis client: %w", err)
+	}
+
+	logger().WithError(err).Warn("Redis is optional and unavailable; continuing with reconnection enabled")
+
+	return client, false, nil
+}
+
 type redisBridgeResult struct {
 	decorator resolver.CacheDecorator
 	bridge    *redis.EventBusBridge
 }
 
 func createRedisCacheDecorator(
-	ctx context.Context, redisConn *goredis.Client, required bool,
+	ctx context.Context, redisConn *goredis.Client, required, connected bool, addCloser func(io.Closer),
 ) (*redisBridgeResult, error) {
 	if redisConn == nil {
 		return &redisBridgeResult{}, nil
 	}
 
-	bridge, err := redis.NewEventBusBridge(ctx, redisConn)
+	bridge, err := redis.NewEventBusBridgeWithOptions(ctx, redisConn, redis.EventBusBridgeOptions{
+		BackgroundConnect: !required,
+	})
 	if err != nil {
 		if required {
 			return nil, fmt.Errorf("failed to create required Redis event bridge: %w", err)
@@ -476,10 +562,18 @@ func createRedisCacheDecorator(
 	}
 
 	decorator := func(inner cache.ExpiringCache[[]byte]) (cache.ExpiringCache[[]byte], error) {
-		return cache.NewRedisExpiringByteCache(ctx, inner, redisConn, cache.RedisOptions[[]byte]{
-			Prefix:  "blocky:cache:",
-			Channel: "blocky_cache_sync",
+		redisCache, err := cache.NewRedisExpiringByteCache(ctx, inner, redisConn, cache.RedisOptions[[]byte]{
+			Prefix:          "blocky:cache:",
+			Channel:         "blocky_cache_sync",
+			SkipInitialLoad: !connected,
 		})
+		if err != nil {
+			return nil, err
+		}
+
+		addCloser(redisCache)
+
+		return redisCache, nil
 	}
 
 	return &redisBridgeResult{decorator: decorator, bridge: bridge}, nil
@@ -634,19 +728,26 @@ func toMB(b uint64) uint64 {
 func (s *Server) Start(ctx context.Context, errCh chan<- error) {
 	logger().Info("Starting server")
 
-	for _, srv := range s.dnsServers {
-		go func() {
-			// When a listener/packet connection was pre-created (freeBind), serve it via
-			// ActivateAndServe; otherwise let miekg/dns create the socket via ListenAndServe.
-			serve := srv.ListenAndServe
-			if srv.Listener != nil || srv.PacketConn != nil {
-				serve = srv.ActivateAndServe
-			}
+	// dnsCtx is cancelled by Stop to abort in-progress bind retries and stop
+	// the DNS serve loops (see retryServe).
+	dnsCtx, cancel := context.WithCancel(ctx)
+	s.dnsCancelMu.Lock()
+	s.dnsStartCancels = append(s.dnsStartCancels, cancel)
+	s.dnsCancelMu.Unlock()
 
-			if err := serve(); err != nil {
-				errCh <- fmt.Errorf("start %s listener failed: %w", srv.Net, err)
+	for _, srv := range s.dnsServers {
+		s.dnsServeWG.Go(func() {
+			if err := retryServe(dnsCtx, srv); err != nil && dnsCtx.Err() == nil {
+				// The error send is cancellation-aware: if the channel has no
+				// reader (or is full) while Stop cancels dnsCtx, we must not
+				// block, otherwise the serve goroutine never finishes and
+				// dnsServeWG.Wait() in Stop hangs past its deadline.
+				select {
+				case errCh <- fmt.Errorf("start %s listener failed: %w", srv.Net, err):
+				case <-dnsCtx.Done():
+				}
 			}
-		}()
+		})
 	}
 
 	for listener, srv := range s.servers {
@@ -684,6 +785,28 @@ func (s *Server) Start(ctx context.Context, errCh chan<- error) {
 func (s *Server) Stop(ctx context.Context) error {
 	logger().Info("Stopping server")
 
+	if s.stopped.Swap(true) {
+		// A repeated Stop is only an error when DNS servers were configured;
+		// without them there is nothing left to double-stop (and the previous
+		// implementation returned nil), so keep that behaviour for callers that
+		// stop a server defensively.
+		if len(s.dnsServers) > 0 {
+			return errors.New("server already stopped")
+		}
+
+		return nil
+	}
+
+	// Cancel every DNS startup context first: a listener whose bind is still
+	// being retried has no socket to close, and cancelling the context makes
+	// the retry loop and the serve loop (see retryServe) stop promptly.
+	s.dnsCancelMu.Lock()
+	for _, cancel := range s.dnsStartCancels {
+		cancel()
+	}
+	s.dnsStartCancels = nil
+	s.dnsCancelMu.Unlock()
+
 	// Shut down HTTP/3 in order: server first (drains in-flight
 	// requests and unblocks the Serve goroutines), then UDP packet
 	// conns. Closing the packet conns first would cause Serve to
@@ -701,17 +824,49 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
+	if s.redisCancel != nil {
+		s.redisCancel()
+	}
+
 	for _, c := range s.closers {
 		if err := c.Close(); err != nil {
 			logger().Warn("failed to close resource: ", err)
 		}
 	}
 
-	for _, server := range s.dnsServers {
-		if err := server.ShutdownContext(ctx); err != nil {
-			return fmt.Errorf("stop %s listener failed: %w", server.Net, err)
+	errs := []error{s.waitForDNSServe(ctx)}
+
+	// After the DNS listeners, so the query log can write what they handed it.
+	for _, sd := range s.shutdowners {
+		errs = append(errs, sd.Shutdown(ctx))
+	}
+
+	return errors.Join(errs...)
+}
+
+// waitForDNSServe waits for the DNS serve goroutines to finish, bounded by the
+// shutdown timeout carried by ctx. When the caller's context is already done there
+// is no deadline left to enforce; the serve goroutines were already told
+// to stop and are shutdown-safe, so wait for them to finish rather
+// than failing immediately.
+func (s *Server) waitForDNSServe(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.dnsServeWG.Wait()
+		close(done)
+	}()
+
+	if ctx.Err() == nil {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("stopping DNS listeners timed out: %w", ctx.Err())
 		}
 	}
+
+	// The context is already done: there is no deadline left to enforce.
+	<-done
 
 	return nil
 }
@@ -730,17 +885,27 @@ func newRequest(
 	clientIP net.IP, clientID string,
 	protocol model.RequestProtocol, request *dns.Msg,
 ) (context.Context, *model.Request) {
-	ctx, logger := log.CtxWithFields(ctx, logrus.Fields{
-		"req_id":    uuid.New().String(),
-		"question":  util.QuestionToString(request.Question),
-		"client_ip": clientIP,
+	// The chain may rename the question in place (see ConditionalUpstreamResolver),
+	// the log entries of the request name what the client asked.
+	questions := slices.Clone(request.Question)
+
+	// Most requests log nothing, so the fields of their log entries are built when the
+	// first one is logged.
+	ctx = log.CtxWithLazyFields(ctx, func() logrus.Fields {
+		return logrus.Fields{
+			"req_id":    uuid.New().String(),
+			"question":  util.QuestionToString(questions),
+			"client_ip": clientIP,
+		}
 	})
 
-	logger.WithFields(logrus.Fields{
-		"client_request_id": request.Id,
-		"client_id":         clientID,
-		"protocol":          protocol,
-	}).Trace("new incoming request")
+	if log.IsLevelEnabled(ctx, logrus.TraceLevel) {
+		log.FromCtx(ctx).WithFields(logrus.Fields{
+			"client_request_id": request.Id,
+			"client_id":         clientID,
+			"protocol":          protocol,
+		}).Trace("new incoming request")
+	}
 
 	req := model.Request{
 		ClientIP:        clientIP,
@@ -775,7 +940,7 @@ func newRequestFromHTTP(ctx context.Context, req *http.Request, msg *dns.Msg) (c
 	protocol := model.RequestProtocolTCP
 	clientIP := util.HTTPClientIP(req)
 
-	clientID := chi.URLParam(req, "clientID")
+	clientID := strings.ToValidUTF8(chi.URLParam(req, "clientID"), "")
 	if clientID == "" {
 		clientID = extractClientIDFromHost(req.Host)
 	}
@@ -821,7 +986,8 @@ func (s *Server) resolve(ctx context.Context, request *model.Request) (response 
 	contextUpstreamTimeoutMultiplier := 100
 	timeoutDuration := time.Duration(contextUpstreamTimeoutMultiplier) * s.cfg.Upstreams.Timeout.ToDuration()
 
-	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
+	// most queries are answered before anything waits on their context
+	ctx, cancel := util.WithLazyTimeout(ctx, timeoutDuration)
 
 	defer cancel()
 
@@ -850,9 +1016,7 @@ func (s *Server) resolve(ctx context.Context, request *model.Request) (response 
 
 		response, err = s.queryResolver.Resolve(ctx, request)
 		if err != nil {
-			var upstreamErr *resolver.UpstreamServerError
-
-			if errors.As(err, &upstreamErr) {
+			if upstreamErr, ok := errors.AsType[*resolver.UpstreamServerError](err); ok {
 				response = &model.Response{Res: upstreamErr.Msg, RType: model.ResponseTypeRESOLVED, Reason: upstreamErr.Error()}
 			} else {
 				return nil, fmt.Errorf("query resolution failed: %w", err)

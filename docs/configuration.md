@@ -126,12 +126,17 @@ All values in this section are optional.
 
 All logging options are optional.
 
-| Parameter     | Type                                   | Default value | Description                                                                                                                                       |
-| ------------- | -------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| log.level     | enum (trace, debug, info, warn, error) | info          | Log level                                                                                                                                         |
-| log.format    | enum (text, json)                      | text          | Log format (text or json).                                                                                                                        |
-| log.timestamp | bool                                   | true          | Log timestamps (true or false).                                                                                                                   |
-| log.privacy   | bool                                   | false         | Obfuscate log output (replace all alphanumeric characters with \*) for user sensitive data like request domains or responses to increase privacy. |
+| Parameter           | Type                                   | Default value | Description                                                                                                                                       |
+| ------------------- | -------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| log.level           | enum (trace, debug, info, warn, error) | info          | Log level                                                                                                                                         |
+| log.format          | enum (text, json)                      | text          | Log format (text or json).                                                                                                                        |
+| log.target          | enum (stdout, stderr, syslog)          | stdout        | Where log entries are written. `syslog` logs each entry at the priority matching its level.                                                       |
+| log.syslog.network  | string                                 |               | Empty for the local syslog socket, otherwise `udp` or `tcp`.                                                                                      |
+| log.syslog.address  | string                                 |               | `host:port` of the syslog server. Requires `network`.                                                                                             |
+| log.syslog.tag      | string                                 | blocky        | Tag each entry is logged under.                                                                                                                   |
+| log.syslog.facility | enum (daemon, user, local0-local7)     | daemon        | Syslog facility.                                                                                                                                  |
+| log.timestamp       | bool                                   | true          | Log timestamps (true or false).                                                                                                                   |
+| log.privacy         | bool                                   | false         | Obfuscate log output (replace all alphanumeric characters with \*) for user sensitive data like request domains or responses to increase privacy. |
 
 !!! example
 
@@ -142,6 +147,24 @@ All logging options are optional.
       timestamp: false
       privacy: true
     ```
+
+!!! example "logging to syslog"
+
+    ```yaml
+    log:
+      target: syslog
+      syslog:
+        tag: blocky
+        facility: daemon
+    ```
+
+    Entries are mapped to syslog priorities: `error` to `err`, `warn` to `warning`,
+    `info` to `info`, `debug` and `trace` to `debug`, and `fatal` and `panic` to `crit`.
+    Each record carries the message alone: syslog supplies the timestamp and the
+    severity itself, so `log.timestamp` is ignored and the level is not repeated in
+    the text. Use `format: json` if you want the level in the message as well.
+    Only the server logs to syslog: CLI commands such as `blocky query` still print
+    to the terminal.
 
 ## Init Strategy
 
@@ -546,7 +569,7 @@ Please be aware that by enabling this your resolution will break unless every qu
 
 You can define your own domain name mappings for local DNS resolution. This is useful for creating user-friendly names for network devices, defining domain names for local services, or creating your own DNS zone.
 
-Custom DNS supports multiple record types (A, AAAA, CNAME, TXT, SRV) and provides automatic reverse DNS lookups for defined IP addresses.
+Custom DNS supports multiple record types (A, AAAA, CNAME, TXT, SRV, HTTPS, SVCB) and provides automatic reverse DNS lookups for defined IP addresses.
 
 | Parameter           | Type                                                   | Mandatory | Default value | Description                                                                                |
 | ------------------- | ------------------------------------------------------ | --------- | ------------- | ------------------------------------------------------------------------------------------ |
@@ -621,6 +644,29 @@ The zone file supports standard DNS zone file syntax including:
 
 For records defined using the `zone` parameter, the `customTTL` parameter is unused. Instead, the TTL is defined in the zone directly.
 
+custom DNS answers queries for `A`, `AAAA`, `CNAME`, `TXT`, `SRV`, `HTTPS` and `SVCB` records. Other
+record types that are valid in a zone file (for example `SOA`, `NS`, `MX`, `CAA` or the DNSSEC
+records of a signed zone) may be present in the zone, but they are not answered by custom DNS: a
+query for such a type gets the same response as a query for a type that is not defined for the name
+(an empty answer, or the query is forwarded upstream when `filterUnmappedTypes` is `false`).
+
+`HTTPS` and `SVCB` records ([RFC 9460](https://www.rfc-editor.org/rfc/rfc9460)) are returned as written
+in the zone, with all their SvcParams. Browsers send an `HTTPS` query next to `A`/`AAAA` for every
+name, so this lets local services announce HTTP/3 support, an alternate port or address hints:
+
+!!! example
+
+    ```yaml
+    customDNS:
+      zone: |
+        $ORIGIN example.com.
+        app 3600 A     192.168.1.10
+        app 3600 HTTPS 1 . alpn="h3,h2" ipv4hint=192.168.1.10
+    ```
+
+When `AAAA` queries are [filtered](#filtering), the `ipv6hint` SvcParam is removed from these answers
+too.
+
 ### CNAME Resolution
 
 When a CNAME record is defined and a query matches that record, blocky will:
@@ -668,6 +714,8 @@ It only has an effect together with `rewrite`; without any rewrite rules it is i
         lan.net: 192.170.1.2,192.170.1.3
         # for reverse DNS lookups of local devices
         178.168.192.in-addr.arpa: 192.168.178.1
+        # for all queries under a TLD (e.g. *.xyz)
+        xyz: 1.1.1.1
         # for all unqualified hostnames
         .: 168.168.0.1
     ```
@@ -675,6 +723,11 @@ It only has an effect together with `rewrite`; without any rewrite rules it is i
 !!! tip
 
     You can use `.` as wildcard for all non full qualified domains (domains without dot)
+
+A mapping key matches the domain itself and all of its subdomains. Since a bare TLD is just a
+parent domain, you can use it to forward an entire TLD to a specific resolver. For example,
+`xyz: 1.1.1.1` sends every query ending in `.xyz` (such as `foo.xyz` and `a.b.xyz`) to `1.1.1.1`,
+just like dnsmasq's `server=/xyz/1.1.1.1`.
 
 In this example, a DNS query "client.fritz.box" will be redirected to the router's DNS server at 192.168.178.1 and client.lan.net to 192.170.1.2 and 192.170.1.3.
 The query "client.example.com" will be rewritten to "client.fritz.box" and also redirected to the resolver at 192.168.178.1.
@@ -817,6 +870,8 @@ The supported list formats are:
 
 You can use wildcards to block a domain and all its subdomains.
 Example: `*.example.com` will block `example.com` and `any.subdomains.example.com`.
+Wildcards are case-insensitive. A wildcard may also be a top-level domain: `*.com` blocks `com` and every domain below it.
+If several wildcards match a domain, the broadest one is reported as the block reason.
 
 #### Regex support
 
@@ -829,6 +884,24 @@ Examples:
 
 !!! warning
     Regexes use more a lot more memory and are much slower than wildcards, you should use them as a last resort.
+
+#### Storage of entries
+
+Exact domains and wildcards are stored as 64-bit hashes, not as text. This keeps even multi-million entry lists small
+(roughly 10 bytes per entry) and makes lookups fast. Regex entries are kept as written.
+
+As a consequence:
+
+- The text of a matched rule is not stored. It is derived from the query: for an exact entry it is the lowercased
+  domain, for a wildcard it is `*.` followed by the matching suffix of the domain. This is what you see as the block
+  reason, in the query log and in the API.
+- A different domain can, with a very small probability, hash to the same value as a listed entry and be treated as
+  listed. The probability is about N / 2^64 per lookup for N entries (about 5 in 10^14 for one million entries), and
+  a few times higher for wildcards, because every parent of the queried domain is checked. On a denylist this
+  wrongly blocks a domain, on an allowlist it wrongly allows one. At this probability neither is a practical concern.
+- The hashes are seeded with a random value chosen each time a list is loaded, which makes crafting a domain that
+  collides with a specific entry, for example one on your allowlist, impractical. The hash is not a vetted keyed hash,
+  so this is a practical barrier, not a cryptographic guarantee. The seed is never written to disk.
 
 ### Client groups
 
@@ -1069,10 +1142,11 @@ Synchronization is disabled if no address is configured.
 Blocky can expose various metrics for prometheus. To use the prometheus feature, the HTTP listener must be enabled (
 see [Basic Configuration](#basic-configuration)).
 
-| Parameter         | Mandatory | Default value | Description                         |
-| ----------------- | --------- | ------------- | ----------------------------------- |
-| prometheus.enable | no        | false         | If true, enables prometheus metrics |
-| prometheus.path   | no        | /metrics      | URL path to the metrics endpoint    |
+| Parameter                    | Mandatory | Default value | Description                         |
+| ---------------------------- | --------- | ------------- | ----------------------------------- |
+| prometheus.enable            | no        | false         | If true, enables prometheus metrics |
+| prometheus.path              | no        | /metrics      | URL path to the metrics endpoint    |
+| prometheus.enableClientLabel | no        | true          | If true, the client name (or IP) is used as the `client` label on `blocky_query_total` and `blocky_client_response_total`. Set to `false` to collapse the label to a single `unknown` value (see [Prometheus](prometheus_grafana.md#prometheus-export)). |
 
 !!! example
 
@@ -1080,6 +1154,7 @@ see [Basic Configuration](#basic-configuration)).
     prometheus:
       enable: true
       path: /metrics
+      enableClientLabel: true
     ```
 
 ## Statistics
@@ -1165,6 +1240,17 @@ You can select one of following query log types:
 - `dnstap`: export client DNS query/response events via [dnstap](https://dnstap.info/) (Frame Streams over Unix socket or TCP)
 - `none`: do not log any queries
 
+#### Database query log
+
+The database targets (`mysql`, `postgresql`, `timescale` and `sqlite`) buffer entries in memory and write them in batches, so DNS answers never wait on the database.
+
+- If the database is slow or can't be opened (unreachable, wrong credentials, a schema that can't be migrated), blocky keeps the entries and retries in the background until they are written. This includes startup: such a database doesn't make blocky fall back to the console, though a malformed `target` still does.
+- On shutdown, blocky writes what is left within its 10-second shutdown timeout, and logs how many entries it had to drop.
+- A write that fails at commit is retried, although the database may have stored it: those entries are then stored again.
+- Client names are stored as valid UTF-8 without control characters, cut to 191 characters. On MySQL and MariaDB, give the database the `utf8mb4` character set, which the table inherits; names it can't store are refused, and finding refused rows takes extra writes.
+- On MySQL and MariaDB the driver sets no time limit on a commit. Add `readTimeout` to the `target` (e.g. `readTimeout=1m`) to have a connection that stops answering dropped and retried; no statement can then run longer than that, the retention cleanup included.
+- Blocky holds about 32 MiB of entries in memory at most. Entries beyond that, and rows the database refuses, are dropped and counted in `blocky_query_log_entries_dropped_total` (see [Prometheus](prometheus_grafana.md)).
+
 #### SQLite query log
 
 The `sqlite` target stores the query log in a single local file (set via `queryLog.target`, e.g. `/var/lib/blocky/querylog.db`) — no external database is required. Blocky creates the file and its parent directory automatically.
@@ -1236,12 +1322,13 @@ Configuration parameters:
 | queryLog.type             | enum (mysql, postgresql, timescale, sqlite, csv, csv-client, console, dnstap, none (see above)) | no        |               | Type of logging target. Console if empty                                                      |
 | queryLog.target           | string                                                                               | no        |               | directory for writing the logs (for csv), database file path (for sqlite), database url (for mysql, postgresql or timescale), or dnstap socket address (`unix:…`, `tcp://…`, or bare `/path`); supports `file:` for database URLs — see [Redis tip](#redis) |
 | queryLog.logRetentionDays | int                                                                                  | no        | 0             | if > 0, deletes log files/database entries which are older than ... days; not used for dnstap   |
-| queryLog.creationAttempts | int                                                                                  | no        | 3             | Max attempts to create specific query log writer                                              |
+| queryLog.creationAttempts | int                                                                                  | no        | 3             | Max attempts to create specific query log writer; an unreachable database is retried in the background instead (see [Database query log](#database-query-log)) |
 | queryLog.creationCooldown | duration format                                                                      | no        | 2s            | Time between the creation attempts                                                            |
 | queryLog.fields           | list enum (clientIP, clientName, responseReason, responseAnswer, question, duration) | no        | all           | which information should be logged; ignored for dnstap                                        |
-| queryLog.flushInterval    | duration format                                                                      | no        | 30s           | Interval to write buffered entries in bulk to the database (mysql/postgresql/timescale/sqlite) or dnstap socket batching |
+| queryLog.flushInterval    | duration format                                                                      | no        | 30s           | Interval to write buffered entries in bulk to the database (mysql/postgresql/timescale/sqlite; also as soon as 1,000 are buffered) or dnstap socket batching |
 | queryLog.ignore.sudn      | bool                                                                                 | no        | false         | if true, queries answered as Special Use Domain Names (SUDN) are not logged                   |
-| queryLog.ignore.domains   | list of string                                                                       | no        |               | domains excluded from the query log; each entry is matched against the query name as an exact domain, a `*.wildcard`, or a `/regex/` |
+| queryLog.ignore.domains   | list of string                                                                       | no        |               | domains excluded from the query log; each entry is matched against the query name as an exact domain, a `*.wildcard`, or a `/regex/` (exact domains and wildcards are stored as hashes, see [Storage of entries](#storage-of-entries)) |
+| queryLog.ignore.clients   | list of string                                                                       | no        |               | clients excluded from the query log; each entry is a client IP, a CIDR, or a client name, which can use `*` and `?` wildcards as in `clientGroupsBlock`. Their queries are still resolved, filtered and counted in the metrics |
 
 !!! hint
 
@@ -1315,6 +1402,23 @@ Parsing is handled not by Blocky, but third-party libraries, therefore the full 
           - "db._dns-sd._udp.home"
           - "/\\.in-addr\\.arpa$/"
           - "apple.com"
+    ```
+
+!!! example
+    **Ignore noisy clients**
+
+    A router or access point that checks its internet connection every few seconds can fill the log.
+    Its queries are still answered and filtered as usual; they just aren't written to the log.
+
+    ```yaml
+    queryLog:
+      type: mysql
+      target: 'username:password@tcp(localhost:3306)/blocky_query_log'
+      ignore:
+        clients:
+          - 192.168.178.1      # client IP
+          - 192.168.178.64/28  # CIDR
+          - "*-ap"             # client name, wildcards allowed
     ```
 
 ## Hosts file
@@ -1429,6 +1533,7 @@ When DNSSEC validation is enabled, Blocky will:
 - Validate authenticated denial of existence using NSEC/NSEC3 records for NXDOMAIN and NODATA responses
 - Validate wildcard expansions according to RFC 4035 §5.3.4
 - Return SERVFAIL for responses with invalid DNSSEC signatures (Bogus)
+- Return the data without validating it, and without the AD flag, to a client that set the Checking Disabled (CD) bit, since that client validates itself (RFC 4035 §3.2.2)
 - Set the Authenticated Data (AD) flag only after successful validation
 - Add Extended DNS Error (EDE) codes per RFC 8914 when validation fails
 

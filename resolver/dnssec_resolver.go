@@ -8,6 +8,7 @@ import (
 	"github.com/0xERR0R/blocky/model"
 	"github.com/0xERR0R/blocky/resolver/dnssec"
 	"github.com/miekg/dns"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -22,6 +23,9 @@ type DNSSECResolver struct {
 	typed
 
 	validator *dnssec.Validator
+	// upstreams picks the upstream group of a client when there are several; validation
+	// results are cached per group
+	upstreams *UpstreamTreeResolver
 }
 
 // NewDNSSECResolver creates a new DNSSEC resolver instance
@@ -31,6 +35,9 @@ func NewDNSSECResolver(ctx context.Context, cfg config.DNSSEC, upstream Resolver
 		configurable: withConfig(&cfg),
 		typed:        withType("dnssec"),
 	}
+	// NewUpstreamTreeResolver returns the group resolver itself when only one group exists, so
+	// any other upstream means a single view
+	r.upstreams, _ = upstream.(*UpstreamTreeResolver)
 
 	// Only initialize validator if DNSSEC is enabled
 	if cfg.IsEnabled() {
@@ -65,27 +72,31 @@ func NewDNSSECResolver(ctx context.Context, cfg config.DNSSEC, upstream Resolver
 
 // Resolve validates DNSSEC signatures if validation is enabled
 func (r *DNSSECResolver) Resolve(ctx context.Context, request *model.Request) (*model.Response, error) {
+	// Without validation the resolver changes neither the query nor the answer, so skip
+	// the per-request work (matches the disabled-path early-return of other resolvers).
+	if !r.cfg.Validate {
+		return r.next.Resolve(ctx, request)
+	}
+
 	ctx, logger := r.log(ctx)
 
-	// If DNSSEC validation is enabled, set the DO (DNSSEC OK) bit. This overwrites what the client
+	// Set the DO (DNSSEC OK) bit. This overwrites what the client
 	// asked for, as RFC 4035 §3.2.1 requires of the resolver side; the server undoes it towards the
 	// client afterwards (see clientQuery.normalizeResponse in server/client_query.go), so don't
 	// make this conditional on the client's DO bit without adapting that.
-	if r.cfg.Validate {
-		// Check if EDNS0 is already present in the request
-		if opt := request.Req.IsEdns0(); opt != nil {
-			// EDNS0 already exists - just set the DO bit
-			opt.SetDo(true)
-			// Ensure buffer size is adequate for DNSSEC responses
-			if opt.UDPSize() < ednsUDPSize {
-				opt.SetUDPSize(ednsUDPSize)
-			}
-			logger.Debugf("DNSSEC DO bit set for query (existing EDNS0): %s", request.Req.Question[0].Name)
-		} else {
-			// No EDNS0 present - add it with DO bit
-			request.Req.SetEdns0(ednsUDPSize, true)
-			logger.Debugf("DNSSEC DO bit set for query (new EDNS0): %s", request.Req.Question[0].Name)
+	// Check if EDNS0 is already present in the request
+	if opt := request.Req.IsEdns0(); opt != nil {
+		// EDNS0 already exists - just set the DO bit
+		opt.SetDo(true)
+		// Ensure buffer size is adequate for DNSSEC responses
+		if opt.UDPSize() < ednsUDPSize {
+			opt.SetUDPSize(ednsUDPSize)
 		}
+		logger.Debugf("DNSSEC DO bit set for query (existing EDNS0): %s", request.Req.Question[0].Name)
+	} else {
+		// No EDNS0 present - add it with DO bit
+		request.Req.SetEdns0(ednsUDPSize, true)
+		logger.Debugf("DNSSEC DO bit set for query (new EDNS0): %s", request.Req.Question[0].Name)
 	}
 
 	// Get response from next resolver (upstream)
@@ -94,32 +105,19 @@ func (r *DNSSECResolver) Resolve(ctx context.Context, request *model.Request) (*
 		return nil, err
 	}
 
-	// Validate DNSSEC if enabled and validator is available
-	if r.cfg.Validate && r.validator != nil && len(request.Req.Question) > 0 {
-		// Only public-upstream answers carry a chain of trust in the public DNS hierarchy and
-		// form the GHSA-x845 attack surface, so validate exactly those: RESOLVED, plus cached
-		// upstream answers re-served as CACHED (re-validated on every hit). Every other response
-		// type that can reach this resolver from below is trusted-local or synthesized -
-		// conditional-upstream private/split-horizon zones (CONDITIONAL), special-use names like
-		// localhost (SPECIAL), DNS64-synthesized AAAA (SYNTHESIZED). Those are inherently unsigned
-		// with no public chain of trust, so the post-GHSA-x845 handling would classify them bogus
-		// - the whole namespace sits under the default root trust anchor - and turn every such
-		// lookup into SERVFAIL (#2126). Mirror the rebinding resolver's response-type whitelist
-		// and skip validation for them, clearing AD since we have not authenticated them. The
-		// RType is assigned by blocky's own resolvers, never by the (attacker-controlled) upstream
-		// answer, so a poisoned public answer cannot mislabel itself out of validation.
-		if response != nil && response.Res != nil &&
-			response.RType != model.ResponseTypeRESOLVED && response.RType != model.ResponseTypeCACHED {
+	// Validate DNSSEC if the validator is available
+	if r.validator != nil && len(request.Req.Question) > 0 {
+		if reason := skipValidationReason(request, response); reason != "" {
 			response.Res.AuthenticatedData = false
-			logger.Debugf("skipping DNSSEC validation for trusted-local/synthesized response (%s): %s",
-				response.RType, request.Req.Question[0].Name)
+			logger.Debugf("skipping DNSSEC validation for %s: %s", reason, request.Req.Question[0].Name)
 
 			return response, nil
 		}
 
 		// Preserve the originating client's identity so DS/DNSKEY sub-queries issued
 		// during validation resolve from the same upstream view as the answer.
-		validationCtx := dnssec.WithClientContext(ctx, request.ClientIP, request.ClientNames, request.RequestClientID)
+		validationCtx := dnssec.WithClientContext(ctx, request.ClientIP, request.ClientNames,
+			request.RequestClientID, r.upstreamGroup(logger, request))
 		result := r.validator.ValidateResponse(validationCtx, response.Res, request.Req.Question[0])
 
 		logger.Debugf("DNSSEC validation result for %s: %s",
@@ -149,6 +147,51 @@ func (r *DNSSECResolver) Resolve(ctx context.Context, request *model.Request) (*
 	}
 
 	return response, nil
+}
+
+// skipValidationReason returns why a response is passed on without validation (with AD cleared,
+// since it wasn't authenticated), or "" if it must be validated.
+func skipValidationReason(request *model.Request, response *model.Response) string {
+	if response == nil || response.Res == nil {
+		return ""
+	}
+
+	// Only public-upstream answers carry a chain of trust in the public DNS hierarchy and
+	// form the GHSA-x845 attack surface, so validate exactly those: RESOLVED, plus cached
+	// upstream answers re-served as CACHED (re-validated on every hit). Every other response
+	// type that can reach this resolver from below is trusted-local or synthesized -
+	// conditional-upstream private/split-horizon zones (CONDITIONAL), special-use names like
+	// localhost (SPECIAL), DNS64-synthesized AAAA (SYNTHESIZED). Those are inherently unsigned
+	// with no public chain of trust, so the post-GHSA-x845 handling would classify them bogus
+	// - the whole namespace sits under the default root trust anchor - and turn every such
+	// lookup into SERVFAIL (#2126). Mirror the rebinding resolver's response-type whitelist
+	// and skip validation for them, clearing AD since we have not authenticated them. The
+	// RType is assigned by blocky's own resolvers, never by the (attacker-controlled) upstream
+	// answer, so a poisoned public answer cannot mislabel itself out of validation.
+	if response.RType != model.ResponseTypeRESOLVED && response.RType != model.ResponseTypeCACHED {
+		return fmt.Sprintf("trusted-local/synthesized response (%s)", response.RType)
+	}
+
+	// A client that sets CD (Checking Disabled) does its own validation and asks for the data as
+	// is, so it gets the data even if Blocky's validation would reject it (RFC 4035 §3.2.2,
+	// RFC 6840 §5.9) - otherwise a validating stub couldn't even fetch the records it needs to
+	// validate. The CD bit is forwarded upstream with the request. Clients without CD still
+	// never get such data: the cache below doesn't store positive answers with CD set, and
+	// whatever it does serve them (e.g. a negative answer) is re-validated as CACHED.
+	if request.Req.CheckingDisabled {
+		return "query with CD bit set"
+	}
+
+	return ""
+}
+
+// upstreamGroup returns the upstream group that answers the DNSSEC sub-queries of a request
+func (r *DNSSECResolver) upstreamGroup(logger *logrus.Entry, request *model.Request) string {
+	if r.upstreams == nil {
+		return ""
+	}
+
+	return r.upstreams.upstreamGroupByClient(logger, request)
 }
 
 // createServFailResponseDNSSEC creates a SERVFAIL response for a DNSSEC validation failure.

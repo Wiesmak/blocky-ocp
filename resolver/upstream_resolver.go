@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/avast/retry-go/v5"
 
 	"github.com/0xERR0R/blocky/config"
 	"github.com/0xERR0R/blocky/log"
@@ -35,9 +35,10 @@ const (
 	retryAttempts        = 3
 	sha256HashLength     = 32
 
-	// connPoolMaxIdle bounds the number of idle DoT connections kept per upstream
-	// address, so a burst of concurrent queries can't leak connections.
-	connPoolMaxIdle = 8
+	// connPoolMaxInFlight bounds the queries pipelined on one DoT connection; once
+	// every connection to an address is this full, another one is opened. 200 is
+	// Unbound's default for the same limit (max-reuse-tcp-queries).
+	connPoolMaxInFlight = 200
 	// connPoolIdleTimeout discards pooled connections idle longer than this,
 	// before an upstream is likely to have closed them.
 	connPoolIdleTimeout = 30 * time.Second
@@ -99,6 +100,9 @@ type UpstreamResolver struct {
 
 	upstreamClient upstreamClient
 	bootstrap      *Bootstrap
+
+	// reason is the reason of every response, built once
+	reason string
 }
 
 type upstreamClient interface {
@@ -112,7 +116,7 @@ type upstreamClient interface {
 
 type dnsUpstreamClient struct {
 	tcpClient, udpClient *dns.Client
-	// pool reuses persistent connections for the connection-oriented DoT path;
+	// pool pipelines the DoT path's queries over persistent connections;
 	// nil for the plain tcp+udp client, whose TCP leg is only a rare fallback
 	// (truncation, question mismatch, UDP failure) and so does not benefit from
 	// pooling.
@@ -208,7 +212,7 @@ func createUpstreamClient(cfg upstreamConfig) upstreamClient {
 			client: &http.Client{
 				Transport: transport,
 			},
-			host: cfg.Host,
+			host: dohHost(cfg.Host),
 		}
 
 	case config.NetProtocolTcpTls:
@@ -219,7 +223,7 @@ func createUpstreamClient(cfg upstreamConfig) upstreamClient {
 
 		return &dnsUpstreamClient{
 			tcpClient: tcpClient,
-			pool:      newConnPool(tcpClient, connPoolMaxIdle, connPoolIdleTimeout),
+			pool:      newConnPool(tcpClient, connPoolMaxInFlight, connPoolIdleTimeout, cfg.Timeout.ToDuration()),
 		}
 
 	case config.NetProtocolQuic:
@@ -239,6 +243,16 @@ func createUpstreamClient(cfg upstreamConfig) upstreamClient {
 		log.Log().Fatalf("invalid protocol %s", cfg.Net)
 		panic("unreachable")
 	}
+}
+
+// dohHost returns the Host header for an upstream host: an IPv6 literal must be
+// in brackets (RFC 9110 §7.2).
+func dohHost(host string) string {
+	if strings.ContainsRune(host, ':') {
+		return "[" + host + "]"
+	}
+
+	return host
 }
 
 func (r *httpUpstreamClient) fmtURL(ip net.IP, port uint16, path string) string {
@@ -356,9 +370,10 @@ func (r *httpUpstreamClient) callExternal(
 	}
 
 	defer func() {
-		// Drain body before closing to allow connection reuse
+		// Drain body before closing to allow connection reuse, but no further than a DNS
+		// message could be: a larger body is not worth reading to keep the connection
 		// See: https://pkg.go.dev/net/http#Response.Body
-		_, _ = io.Copy(io.Discard, httpResponse.Body)
+		_, _ = io.CopyN(io.Discard, httpResponse.Body, dns.MaxMsgSize)
 		util.LogOnError(ctx, "can't close response body ", httpResponse.Body.Close())
 	}()
 
@@ -372,9 +387,15 @@ func (r *httpUpstreamClient) callExternal(
 			dnsContentType, contentType)
 	}
 
-	body, err := io.ReadAll(httpResponse.Body)
+	// A DNS message is at most dns.MaxMsgSize bytes; read one more to detect a larger body
+	// instead of buffering whatever the upstream sends
+	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, dns.MaxMsgSize+1))
 	if err != nil {
 		return nil, 0, fmt.Errorf("can't read response body:  %w", err)
+	}
+
+	if len(body) > dns.MaxMsgSize {
+		return nil, 0, fmt.Errorf("response body is larger than %d bytes", dns.MaxMsgSize)
 	}
 
 	response := dns.Msg{}
@@ -390,8 +411,8 @@ func (r *dnsUpstreamClient) fmtURL(ip net.IP, port uint16, _ string) string {
 	return net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
 }
 
-// Close releases the connection pool's idle connections, if pooling is in use
-// (the DoT path). Implements io.Closer.
+// Close closes the connection pool's connections, if pooling is in use (the DoT
+// path). Implements io.Closer.
 func (r *dnsUpstreamClient) Close() error {
 	if r.pool != nil {
 		return r.pool.Close()
@@ -579,13 +600,20 @@ func NewUpstreamResolver(
 func newUpstreamResolverUnchecked(cfg upstreamConfig, bootstrap *Bootstrap) *UpstreamResolver {
 	upstreamClient := createUpstreamClient(cfg)
 
-	return &UpstreamResolver{
+	r := &UpstreamResolver{
 		typed:        withType(upstreamResolverType),
 		configurable: withConfig(cfg),
 
 		upstreamClient: upstreamClient,
 		bootstrap:      bootstrap,
+
+		reason: fmt.Sprintf("RESOLVED (%s)", cfg),
 	}
+
+	// the resolver's loggers name its upstream
+	r.logFields[logFieldUpstream] = cfg.String()
+
+	return r
 }
 
 func (r UpstreamResolver) String() string {
@@ -594,12 +622,6 @@ func (r UpstreamResolver) String() string {
 
 func (r UpstreamResolver) Upstream() config.Upstream {
 	return r.cfg.Upstream
-}
-
-func (r *UpstreamResolver) log(ctx context.Context) (context.Context, *logrus.Entry) {
-	return r.logWithFields(ctx, logrus.Fields{
-		logFieldUpstream: r.cfg.String(),
-	})
 }
 
 // testResolve sends a test query to verify the upstream is reachable and working
@@ -629,7 +651,23 @@ func (r *UpstreamResolver) Resolve(ctx context.Context, request *model.Request) 
 		ip   net.IP
 	)
 
-	err = retry.Do(
+	err = retry.New(
+		retry.Context(ctx),
+		retry.Attempts(retryAttempts),
+		retry.DelayType(retry.FixedDelay),
+		retry.Delay(1*time.Millisecond),
+		retry.LastErrorOnly(true),
+		retry.RetryIf(isTimeout),
+		retry.OnRetry(func(n uint, err error) {
+			logger.WithFields(logrus.Fields{
+				logFieldUpstream: r.cfg.String(),
+				"upstream_ip":    ip.String(),
+				"question":       util.QuestionToString(request.Req.Question),
+				"attempt":        fmt.Sprintf("%d/%d", n+1, retryAttempts),
+			}).Debugf("%s, retrying...", err)
+
+			ips.Next()
+		})).Do(
 		func() error {
 			ip = ips.Current()
 			upstreamURL := r.upstreamClient.fmtURL(ip, r.cfg.Port, r.cfg.Path)
@@ -646,28 +684,12 @@ func (r *UpstreamResolver) Resolve(ctx context.Context, request *model.Request) 
 			r.logResponse(logger, request, response, ip, rtt)
 
 			return nil
-		},
-		retry.Context(ctx),
-		retry.Attempts(retryAttempts),
-		retry.DelayType(retry.FixedDelay),
-		retry.Delay(1*time.Millisecond),
-		retry.LastErrorOnly(true),
-		retry.RetryIf(isTimeout),
-		retry.OnRetry(func(n uint, err error) {
-			logger.WithFields(logrus.Fields{
-				logFieldUpstream: r.cfg.String(),
-				"upstream_ip":    ip.String(),
-				"question":       util.QuestionToString(request.Req.Question),
-				"attempt":        fmt.Sprintf("%d/%d", n+1, retryAttempts),
-			}).Debugf("%s, retrying...", err)
-
-			ips.Next()
-		}))
+		})
 	if err != nil {
 		return nil, fmt.Errorf("all %d attempts to resolve via upstream %s failed: %w", retryAttempts, r.cfg.String(), err)
 	}
 
-	return &model.Response{Res: resp, Reason: fmt.Sprintf("RESOLVED (%s)", r.cfg)}, nil
+	return &model.Response{Res: resp, Reason: r.reason}, nil
 }
 
 func (r *UpstreamResolver) logResponse(

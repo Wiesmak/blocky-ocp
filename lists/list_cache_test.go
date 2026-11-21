@@ -89,6 +89,16 @@ var _ = Describe("ListCache", func() {
 	})
 
 	Describe("List cache and matching", func() {
+		When("No lists are configured", func() {
+			BeforeEach(func() {
+				lists = map[string][]config.BytesSource{}
+			})
+
+			It("should not match anything", func() {
+				Expect(sut.Match("google.com", []string{"gr1"})).Should(BeEmpty())
+			})
+		})
+
 		When("List is empty", func() {
 			BeforeEach(func() {
 				lists = map[string][]config.BytesSource{
@@ -312,9 +322,9 @@ var _ = Describe("ListCache", func() {
 				lines1, lines2, lines3 int
 			)
 			BeforeEach(func() {
-				file1, lines1 = createTestListFile(GinkgoT().TempDir(), 10000)
-				file2, lines2 = createTestListFile(GinkgoT().TempDir(), 15000)
-				file3, lines3 = createTestListFile(GinkgoT().TempDir(), 13000)
+				file1, lines1 = createTestListFile(GinkgoT(), GinkgoT().TempDir(), 10000)
+				file2, lines2 = createTestListFile(GinkgoT(), GinkgoT().TempDir(), 15000)
+				file3, lines3 = createTestListFile(GinkgoT(), GinkgoT().TempDir(), 13000)
 				lists = map[string][]config.BytesSource{
 					"gr1": config.NewBytesSources(file1, file2, file3),
 				}
@@ -592,10 +602,18 @@ func mockListSource() config.BytesSource {
 	}
 }
 
-func createTestListFile(dir string, totalLines int) (string, int) {
+// testFailer is satisfied by both *testing.B and GinkgoT().
+type testFailer interface {
+	Helper()
+	Fatal(args ...any)
+}
+
+func createTestListFile(tb testFailer, dir string, totalLines int) (string, int) {
+	tb.Helper()
+
 	file, err := os.CreateTemp(dir, "blocky")
 	if err != nil {
-		log.Log().Fatal(err)
+		tb.Fatal(err)
 	}
 
 	w := bufio.NewWriter(file)
@@ -603,7 +621,12 @@ func createTestListFile(dir string, totalLines int) (string, int) {
 		fmt.Fprintln(w, uuid.NewString()+".com")
 	}
 
-	Expect(w.Flush()).Should(Succeed())
+	// close the file even if flushing fails, and report both errors
+	flushErr := w.Flush()
+	closeErr := file.Close()
+	if err := errors.Join(flushErr, closeErr); err != nil {
+		tb.Fatal(err)
+	}
 
 	return file.Name(), totalLines
 }

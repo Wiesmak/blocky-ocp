@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/0xERR0R/blocky/config"
@@ -110,7 +111,10 @@ func (r *UpstreamTreeResolver) Resolve(ctx context.Context, request *model.Reque
 	group := r.upstreamGroupByClient(logger, request)
 
 	// delegate request to group resolver
-	logger.WithField("resolver", fmt.Sprintf("%s (%s)", group, r.branches[group].Type())).Debug("delegating to resolver")
+	if isDebugEnabled(logger) {
+		logger.WithField("resolver", fmt.Sprintf("%s (%s)", group, r.branches[group].Type())).
+			Debug("delegating to resolver")
+	}
 
 	resp, err := r.branches[group].Resolve(ctx, request)
 	if err != nil {
@@ -149,6 +153,10 @@ func (r *UpstreamTreeResolver) upstreamGroupByClient(logger *logrus.Entry, reque
 
 	if len(groups) > 0 {
 		if len(groups) > 1 {
+			// Pick the same group for every request of the client: the DNSSEC resolver keys its
+			// validation cache by this group, and its sub-queries must reach the same group.
+			slices.Sort(groups)
+
 			logger.WithFields(logrus.Fields{
 				"clientNames": request.ClientNames,
 				"clientIP":    clientIP,
